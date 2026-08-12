@@ -727,7 +727,7 @@ def page_dashboard(db: Database, user_id: int):
 
 
 def page_log_workout(db: Database, user_id: int):
-    st.title("📝 Log Workout")
+    st.title("Log Workout")
     st.caption(f"Logged in as **{st.session_state.username}**")
 
     lifts = db.get_lifts(user_id)
@@ -802,7 +802,7 @@ def page_log_workout(db: Database, user_id: int):
 
 
 def page_history(db: Database, user_id: int):
-    st.title("📚 Workout History")
+    st.title("Workout History")
     st.caption(f"Logged in as **{st.session_state.username}**")
 
     lifts = db.get_lifts(user_id)
@@ -838,7 +838,7 @@ def page_history(db: Database, user_id: int):
 
 
 def page_export(db: Database, user_id: int):
-    st.title("📤 Export Data")
+    st.title("Export Data")
     st.caption(f"Logged in as **{st.session_state.username}**")
 
     lifts = db.get_lifts(user_id)
@@ -876,7 +876,7 @@ def page_export(db: Database, user_id: int):
 
 
 def page_settings(db: Database, user_id: int):
-    st.title("⚙️ Settings")
+    st.title("Settings")
     st.caption(f"Logged in as **{st.session_state.username}**")
 
     st.markdown("### Model Parameters")
@@ -959,25 +959,25 @@ def main():
     st.sidebar.markdown("---")
 
     page = st.sidebar.radio("Navigate", [
-        "🏠 Dashboard",
-        "📝 Log Workout",
-        "📚 History",
-        "📤 Export",
-        "⚙️ Settings"
+        "Dashboard",
+        "Log Workout",
+        "History",
+        "Export",
+        "Settings"
     ])
 
     st.sidebar.markdown("---")
     
 
-    if page == "🏠 Dashboard":
+    if page == "Dashboard":
         page_dashboard(db, user_id)
-    elif page == "📝 Log Workout":
+    elif page == "Log Workout":
         page_log_workout(db, user_id)
-    elif page == "📚 History":
+    elif page == "History":
         page_history(db, user_id)
-    elif page == "📤 Export":
+    elif page == "Export":
         page_export(db, user_id)
-    elif page == "⚙️ Settings":
+    elif page == "Settings":
         page_settings(db, user_id)
 
 
