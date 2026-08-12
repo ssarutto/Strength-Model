@@ -797,7 +797,7 @@ def page_log_workout(db: Database, user_id: int):
             db.add_set(user_id, wid, i+1, w, r, rir_val)
 
         st.success(f"Workout saved for **{lift_name}** on {workout_date}!")
-        st.balloons()
+        
         st.session_state.num_sets = 3
 
 
