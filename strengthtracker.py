@@ -943,7 +943,7 @@ def main():
     ])
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("💡 Tip: Add this page to your phone's home screen for app-like access.")
+    
 
     if page == "🏠 Dashboard":
         page_dashboard(db)
