@@ -922,25 +922,7 @@ def page_settings(db: Database):
         st.success("Demo data generated! Go to the Dashboard to see it in action.")
         st.rerun()
 
-    st.markdown("---")
-    st.markdown("### About")
-    st.markdown("""
-    **StrengthTracker** uses a domain-adapted Kalman Filter to separate true latent strength 
-    from noisy workout observations. It models:
-
-    - **Progressive adaptation** (mu): slow strength drift upward
-    - **Fatigue accumulation** (rho, alpha, gamma): stress builds and decays
-    - **Scale-corrected residuals**: normalized by strength to prevent magnitude mismatches
-    - **Adaptive trust**: big residuals inflate measurement noise so outliers don't break the model
-    - **RIR-aware stress**: closer to failure = higher stress via `1 + 0.3*(3-RIR)`
-
-    The prediction for your next session is:
-
-    `E_next = S_t - lambda_f * F_t + mu`
-
-    with a 95% confidence interval derived from the posterior covariance.
-    """)
-
+    
 
 # =============================================================================
 # MAIN APP
