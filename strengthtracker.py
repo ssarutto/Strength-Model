@@ -607,8 +607,8 @@ def export_to_excel(db: Database, user_id: int, lift_id: Optional[int] = None) -
 # =============================================================================
 def page_auth(db: Database):
     st.markdown('<div class="auth-box">', unsafe_allow_html=True)
-    st.markdown("<h2 style='text-align:center;margin-bottom:4px;'>💪 StrengthTracker</h2>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align:center;opacity:0.6;margin-bottom:24px;'>Kalman-filtered strength tracking</p>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align:center;margin-bottom:4px;'> Strength Model</h2>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;opacity:0.6;margin-bottom:24px;'>Linear Estimation Towards Linear Progression</p>", unsafe_allow_html=True)
 
     tab_login, tab_register = st.tabs(["Sign In", "Create Account"])
 
