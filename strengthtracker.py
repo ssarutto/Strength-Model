@@ -650,7 +650,7 @@ def page_auth(db: Database):
 # APP PAGES (User-Isolated)
 # =============================================================================
 def page_dashboard(db: Database, user_id: int):
-    st.title("💪 StrengthTracker Dashboard")
+    st.title("Model Dashboard")
     st.caption(f"Logged in as **{st.session_state.username}**")
 
     lifts = db.get_lifts(user_id)
@@ -954,7 +954,7 @@ def main():
     user_id = st.session_state.user_id
 
     # Navigation
-    st.sidebar.title("StrengthTracker")
+    st.sidebar.title("Strength Model")
     st.sidebar.markdown(f"**{st.session_state.username}**")
     st.sidebar.markdown("---")
 
