@@ -1,10 +1,14 @@
 """
-StrengthTracker — Multi-User Edition
-=====================================
-Per-user data isolation with simple username/password auth.
-Each user sees only their own lifts, predictions, and history.
+StrengthTracker — Streamlined Multi-User Edition
+=================================================
 
-Deploy to Streamlit Cloud: share.streamlit.io
+
+Features:
+  - Expandable full-screen graph (click to examine, click away to close)
+  - Info popovers on every dashboard metric
+  - Programming assistant: input reps/sets/RIR → get recommended weight
+
+Deploy: streamlit run strengthtracker.py
 """
 
 import streamlit as st
@@ -25,7 +29,6 @@ DB_PATH = "strengthtracker.db"
 
 st.set_page_config(
     page_title="StrengthTracker",
-    page_icon="💪",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -38,6 +41,7 @@ st.markdown("""
         background: linear-gradient(135deg, #1e3a5f 0%, #0d1b2a 100%);
         border-radius: 12px; padding: 16px; color: white;
         margin-bottom: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        position: relative;
     }
     .metric-label {
         font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;
@@ -48,14 +52,24 @@ st.markdown("""
         background: linear-gradient(135deg, #134e4a 0%, #0f2e2b 100%);
         border-radius: 12px; padding: 20px; color: white;
         text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.15);
+        margin-bottom: 20px;
     }
     .prediction-main { font-size: 2.2rem; font-weight: 800; }
     .prediction-ci { font-size: 0.9rem; opacity: 0.85; margin-top: 4px; }
+    .prog-card {
+        background: #1e293b; border-radius: 12px; padding: 20px;
+        border: 1px solid #334155;
+    }
     h1, h2, h3 { color: #e0e7ff; }
     .auth-box {
         max-width: 400px; margin: 60px auto;
         background: #1e293b; border-radius: 16px;
         padding: 32px; box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+    }
+    /* Dialog override for full-screen feel */
+    [data-testid="stDialog"] > div > div {
+        max-width: 95vw !important;
+        width: 95vw !important;
     }
     @media (max-width: 768px) {
         .block-container { padding: 1rem 0.5rem; }
@@ -607,7 +621,7 @@ def export_to_excel(db: Database, user_id: int, lift_id: Optional[int] = None) -
 # =============================================================================
 def page_auth(db: Database):
     st.markdown('<div class="auth-box">', unsafe_allow_html=True)
-    st.markdown("<h2 style='text-align:center;margin-bottom:4px;'> Strength Model</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align:center;margin-bottom:4px;'>Strength Model</h2>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;opacity:0.6;margin-bottom:24px;'>Linear Estimation Towards Linear Progression</p>", unsafe_allow_html=True)
 
     tab_login, tab_register = st.tabs(["Sign In", "Create Account"])
@@ -647,7 +661,90 @@ def page_auth(db: Database):
 
 
 # =============================================================================
-# APP PAGES (User-Isolated)
+# METRIC CARD WITH INFO POPOVER
+# =============================================================================
+def metric_with_info(label: str, value: str, info_text: str):
+    """Render a metric card with an info popover in the top-right corner."""
+    c1, c2 = st.columns([0.85, 0.15])
+    with c1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">{label}</div>
+            <div class="metric-value">{value}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c2:
+        # Use a tiny bit of vertical padding to align with card top
+        st.markdown("<div style='height:4px;'></div>", unsafe_allow_html=True)
+        with st.popover("?", use_container_width=True):
+            st.markdown(info_text)
+
+
+# =============================================================================
+# PROGRAMMING ASSISTANT
+# =============================================================================
+def programming_assistant(expected_1rm: float):
+    """Render the programming assistant section."""
+    st.markdown("---")
+    st.markdown("### Programming Assistant")
+    st.caption("Enter your target rep scheme and RIR to get a recommended working weight.")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        target_reps = st.number_input("Reps per set", min_value=1, max_value=20, value=5, step=1)
+    with c2:
+        target_sets = st.number_input("Number of sets", min_value=1, max_value=10, value=3, step=1)
+    with c3:
+        target_rir = st.number_input("Target RIR", min_value=0, max_value=10, value=2, step=1)
+
+    effective_reps = target_reps + target_rir
+    if effective_reps >= 37:
+        recommended = expected_1rm
+    else:
+        brzycki_factor = (1.0278 - 0.0278 * effective_reps)
+        recommended = expected_1rm * brzycki_factor
+
+    # Round to nearest 2.5 lbs (standard plate increments)
+    recommended_rounded = round(recommended / 2.5) * 2.5
+
+    st.markdown(f"""
+    <div class="prog-card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px;">
+            <div>
+                <div style="font-size:0.75rem;text-transform:uppercase;opacity:0.6;letter-spacing:0.05em;">Recommended Weight</div>
+                <div style="font-size:2rem;font-weight:800;color:#e0e7ff;">{recommended_rounded:.1f} <span style="font-size:1rem;opacity:0.6;">lbs</span></div>
+                <div style="font-size:0.85rem;opacity:0.6;margin-top:4px;">for {target_sets} sets of {target_reps} reps @ RIR {target_rir}</div>
+            </div>
+            <div style="text-align:right;">
+                <div style="font-size:0.75rem;text-transform:uppercase;opacity:0.6;letter-spacing:0.05em;">Raw Calculation</div>
+                <div style="font-size:1.1rem;font-weight:600;color:#94a3b8;">{recommended:.1f} lbs</div>
+                <div style="font-size:0.75rem;opacity:0.5;margin-top:2px;">Brzycki factor: {brzycki_factor:.3f}</div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Quick reference table
+    with st.expander("Quick Reference Table"):
+        schemes = []
+        for reps in [1, 2, 3, 4, 5, 6, 8, 10, 12]:
+            for rir in [0, 1, 2, 3, 4]:
+                er = reps + rir
+                if er >= 37:
+                    w = expected_1rm
+                else:
+                    w = expected_1rm * (1.0278 - 0.0278 * er)
+                schemes.append({
+                    'Reps': reps, 'RIR': rir, 'Eff. Reps': er,
+                    'Weight (lbs)': round(round(w / 2.5) * 2.5, 1)
+                })
+        ref_df = pd.DataFrame(schemes)
+        pivot = ref_df.pivot(index='Reps', columns='RIR', values='Weight (lbs)')
+        st.dataframe(pivot, use_container_width=True)
+
+
+# =============================================================================
+# DASHBOARD (with graph dialog, info popovers, programming assistant)
 # =============================================================================
 def page_dashboard(db: Database, user_id: int):
     st.title("Model Dashboard")
@@ -655,7 +752,7 @@ def page_dashboard(db: Database, user_id: int):
 
     lifts = db.get_lifts(user_id)
     if not lifts:
-        st.info("No workouts logged yet. Head to **Log Workout** to get started, or load **Demo Data** from Settings.")
+        st.info("No workouts logged yet. Head to Log Workout to get started, or load Demo Data from Settings.")
         return
 
     lift_names = {l['name']: l['id'] for l in lifts}
@@ -675,37 +772,41 @@ def page_dashboard(db: Database, user_id: int):
     latest = results.iloc[-1]
     pred, ci_low, ci_high = model.predict_next(sessions_ahead=1)
 
+    # --- Metrics with info popovers ---
     mcol1, mcol2, mcol3, mcol4 = st.columns(4)
     with mcol1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">True Strength</div>
-            <div class="metric-value">{latest['strength']:.1f} <small>lbs</small></div>
-        </div>
-        """, unsafe_allow_html=True)
+        metric_with_info(
+            "True Strength",
+            f"{latest['strength']:.1f} <small>lbs</small>",
+            "**True Strength** is the filter's best estimate of your latent 1-rep max, stripped of fatigue and measurement noise. "
+            "It drifts upward slowly via the progressive gain parameter (mu). "
+            "Units: pounds (lbs)."
+        )
     with mcol2:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Current Fatigue</div>
-            <div class="metric-value">{latest['fatigue']:.1f}</div>
-        </div>
-        """, unsafe_allow_html=True)
+        metric_with_info(
+            "Current Fatigue",
+            f"{latest['fatigue']:.1f}",
+            "**Fatigue** accumulates from session stress and underperformance residuals, then decays between sessions. "
+            "It is dimensionless but scaled to live on the same order as stress (~5-15). "
+            "High fatigue suppresses your expected performance but does not linearly reduce true strength."
+        )
     with mcol3:
         delta = latest['strength'] - results.iloc[0]['strength']
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Total Gain</div>
-            <div class="metric-value">+{delta:.1f} <small>lbs</small></div>
-        </div>
-        """, unsafe_allow_html=True)
+        metric_with_info(
+            "Total Gain",
+            f"+{delta:.1f} <small>lbs</small>",
+            "**Total Gain** is the difference between your current smoothed strength and your strength at the first logged session. "
+            "It reflects the cumulative effect of the progressive gain parameter (mu) across all sessions."
+        )
     with mcol4:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Sessions</div>
-            <div class="metric-value">{len(results)}</div>
-        </div>
-        """, unsafe_allow_html=True)
+        metric_with_info(
+            "Sessions",
+            f"{len(results)}",
+            "**Sessions** is the total number of workouts logged for this lift. "
+            "The filter needs at least 3-4 sessions to stabilize; early estimates may be noisy."
+        )
 
+    # --- Prediction Card ---
     st.markdown("---")
     st.markdown(f"""
     <div class="prediction-card">
@@ -715,17 +816,37 @@ def page_dashboard(db: Database, user_id: int):
     </div>
     """, unsafe_allow_html=True)
 
+    # --- Programming Assistant ---
+    programming_assistant(pred)
+
+    # --- Main Chart ---
     st.markdown("---")
     fig = create_dashboard_plot(model, results, selected_lift, projection_weeks)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="main_chart")
 
-    with st.expander("📋 Recent Session Details"):
+    # --- Expand Graph Button ---
+    if st.button("Expand Graph", use_container_width=True):
+        show_graph_dialog(model, results, selected_lift, projection_weeks)
+
+    # --- Recent History ---
+    with st.expander("Recent Session Details"):
         display_df = results[['date', 'observed', 'predicted', 'residual', 'stress', 'fatigue', 'strength']].tail(10)
         display_df = display_df.round(2)
         display_df.columns = ['Date', 'Observed', 'Expected', 'Residual', 'Stress', 'Fatigue', 'Smoothed Strength']
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
+@st.dialog("Strength Trajectory", width="large")
+def show_graph_dialog(model: StrengthModel, results_df: pd.DataFrame, lift_name: str, projection_weeks: int):
+    """Full-screen dialog for examining the graph. Click outside or press Escape to close."""
+    st.caption("Click outside this dialog or press Escape to return.")
+    fig = create_dashboard_plot(model, results_df, lift_name, projection_weeks)
+    st.plotly_chart(fig, use_container_width=True, height=700)
+
+
+# =============================================================================
+# LOG WORKOUT
+# =============================================================================
 def page_log_workout(db: Database, user_id: int):
     st.title("Log Workout")
     st.caption(f"Logged in as **{st.session_state.username}**")
@@ -767,11 +888,11 @@ def page_log_workout(db: Database, user_id: int):
 
     c1, c2, c3 = st.columns([1, 1, 3])
     with c1:
-        if st.button("➕ Add Set", use_container_width=True):
+        if st.button("Add Set", use_container_width=True):
             st.session_state.num_sets += 1
             st.rerun()
     with c2:
-        if st.button("➖ Remove Set", use_container_width=True) and st.session_state.num_sets > 1:
+        if st.button("Remove Set", use_container_width=True) and st.session_state.num_sets > 1:
             st.session_state.num_sets -= 1
             st.rerun()
 
@@ -784,7 +905,7 @@ def page_log_workout(db: Database, user_id: int):
     st.markdown("**Estimated 1RMs:** " + ", ".join([f"Set {i+1}: **{e:.1f}** lbs" for i, e in enumerate(est_1rms)]))
     st.markdown(f"**Best estimated 1RM:** Set {best_idx+1} at **{est_1rms[best_idx]:.1f}** lbs")
 
-    if st.button("💾 Save Workout", type="primary", use_container_width=True):
+    if st.button("Save Workout", type="primary", use_container_width=True):
         if lift_choice == "+ New Lift" and (not new_lift_name or not new_lift_name.strip()):
             st.error("Please enter a name for the new lift.")
             return
@@ -797,10 +918,12 @@ def page_log_workout(db: Database, user_id: int):
             db.add_set(user_id, wid, i+1, w, r, rir_val)
 
         st.success(f"Workout saved for **{lift_name}** on {workout_date}!")
-        
         st.session_state.num_sets = 3
 
 
+# =============================================================================
+# HISTORY
+# =============================================================================
 def page_history(db: Database, user_id: int):
     st.title("Workout History")
     st.caption(f"Logged in as **{st.session_state.username}**")
@@ -831,12 +954,15 @@ def page_history(db: Database, user_id: int):
             with c2:
                 st.caption(f"{row['num_sets']} sets: {row['sets_summary']}")
             with c3:
-                if st.button("🗑️ Delete", key=f"del_{row['id']}"):
+                if st.button("Delete", key=f"del_{row['id']}"):
                     db.delete_workout(user_id, row['id'])
                     st.rerun()
             st.divider()
 
 
+# =============================================================================
+# EXPORT
+# =============================================================================
 def page_export(db: Database, user_id: int):
     st.title("Export Data")
     st.caption(f"Logged in as **{st.session_state.username}**")
@@ -852,7 +978,7 @@ def page_export(db: Database, user_id: int):
     selected = st.selectbox("Select Lift to Export", list(lift_names.keys()))
     lift_id = lift_names[selected]
 
-    if st.button("📥 Download Excel", type="primary"):
+    if st.button("Download Excel", type="primary"):
         excel_data = export_to_excel(db, user_id, lift_id)
         st.download_button(
             label="Click to Download",
@@ -875,6 +1001,9 @@ def page_export(db: Database, user_id: int):
             st.dataframe(display, use_container_width=True, hide_index=True)
 
 
+# =============================================================================
+# SETTINGS
+# =============================================================================
 def page_settings(db: Database, user_id: int):
     st.title("Settings")
     st.caption(f"Logged in as **{st.session_state.username}**")
@@ -918,26 +1047,39 @@ def page_settings(db: Database, user_id: int):
         selected = st.selectbox("Apply to Lift", list(lift_names.keys()))
         lift_id = lift_names[selected]
 
-        if st.button("💾 Save Parameters", type="primary"):
+        if st.button("Save Parameters", type="primary"):
             db.save_params(user_id, lift_id, params)
             st.success(f"Parameters saved for **{selected}**!")
 
     st.markdown("---")
     st.markdown("### Demo Data")
-    if st.button("🎲 Generate Demo Data", help="Creates 12 weeks of Bench Press and 8 weeks of Squat"):
+    if st.button("Generate Demo Data", help="Creates 12 weeks of Bench Press and 8 weeks of Squat"):
         generate_demo_data(db, user_id)
         st.success("Demo data generated! Go to the Dashboard.")
         st.rerun()
 
     st.markdown("---")
     st.markdown("### Account")
-    if st.button("🚪 Sign Out", type="secondary"):
+    if st.button("Sign Out", type="secondary"):
         for key in ['user_id', 'username']:
             if key in st.session_state:
                 del st.session_state[key]
         st.rerun()
 
-    
+    st.markdown("---")
+    st.markdown("### About")
+    st.markdown("""
+    **StrengthTracker** uses a domain-adapted Kalman Filter to separate true latent strength
+    from noisy workout observations. Key features:
+
+    - **Progressive adaptation** (mu): slow strength drift upward
+    - **Fatigue accumulation** (rho, alpha, gamma): stress builds and decays
+    - **Scale-corrected residuals**: normalized by strength to prevent magnitude mismatches
+    - **Adaptive trust**: big residuals inflate measurement noise so outliers don't break the model
+    - **RIR-aware stress**: closer to failure = higher stress via `1 + 0.3*(3-RIR)`
+
+    Prediction: `E_next = S_t - lambda_f * F_t + mu` with 95% CI from posterior covariance.
+    """)
 
 
 # =============================================================================
@@ -967,7 +1109,6 @@ def main():
     ])
 
     st.sidebar.markdown("---")
-    
 
     if page == "Dashboard":
         page_dashboard(db, user_id)
