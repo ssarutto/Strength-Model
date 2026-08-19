@@ -288,124 +288,365 @@ class WorkoutSet:
         return self.reps + self.rir
 
     def estimated_1rm(self) -> float:
+        """Temporary set-level capacity observation using RIR-adjusted Brzycki."""
         er = self.effective_reps()
         if er >= 37:
             return self.weight
         return self.weight / (1.0278 - 0.0278 * er)
 
-    def stress(self, baseline_strength: float) -> float:
-        if baseline_strength <= 0:
-            baseline_strength = self.weight
-        rir_mult = 1.0 + 0.3 * max(0, 3 - self.rir)
-        return (self.weight / baseline_strength) * self.reps * rir_mult
+    def observation_variance(self, sigma_obs: float, sigma_rir: float) -> float:
+        """R_tj = sigma_obs^2 + (sigma_rir * RIR)^2."""
+        return sigma_obs ** 2 + (sigma_rir * max(0, self.rir)) ** 2
+
+    def dose(self, available_capacity: float, intensity_p: float, rir_penalty_c: float, rir_threshold: float) -> float:
+        """Dimensionless training dose; converted to fatigue later by parameter b."""
+        capacity = max(float(available_capacity), 1.0)
+        rel_intensity = self.weight / capacity
+        rir_mult = 1.0 + rir_penalty_c * max(0.0, rir_threshold - self.rir)
+        return self.reps * (rel_intensity ** intensity_p) * rir_mult
 
 
 @dataclass
 class SessionResult:
     date: str
-    observed: float
-    predicted: float
-    residual: float
-    resid_norm: float
-    stress: float
-    fatigue: float
-    strength: float
-    covariance: float
-    K: float
-    ci_95: float
+    days_since_prior: float
+    num_sets: int
+    observed: float                 # inverse-variance weighted mean; display only
+    predicted: float                # pre-session predicted available capacity S^- - F^-
+    residual: float                 # observed - predicted; display only
+    mean_abs_z: float               # mean standardized innovation across set updates
+    stress: float                   # dimensionless session dose U_t
+    fatigue_pre: float              # posterior fatigue after set observations, before session dose
+    fatigue: float                  # post-session fatigue carried forward
+    strength: float                 # posterior latent fresh strength
+    available_pre_stress: float     # S - F after observation updates
+    available_post_stress: float    # S - F after adding this session's fatigue dose
+    p_ss: float
+    p_sf: float
+    p_ff: float
+    strength_ci_95: float
+    capacity_ci_95: float
 
 
 # =============================================================================
-# KALMAN FILTER
+# JOINT STRENGTH / FATIGUE STATE-SPACE FILTER
 # =============================================================================
 class StrengthModel:
+    """
+    Two-state linear-Gaussian prototype.
+
+    State:      x_t = [S_t, F_t]^T
+    Observation y_tj = [1, -1] x_t + epsilon_tj
+
+    S is latent fresh 1RM-equivalent strength (lb).
+    F is fatigue in the same lb-equivalent performance-suppression units.
+    Training dose is dimensionless and is applied *after* session observations.
+    """
+
     DEFAULT_PARAMS = {
-        'mu': 0.3, 'rho': 0.70, 'alpha': 0.30, 'gamma': 8.0,
-        'lambda_f': 0.60, 'Q': 2.0, 'R': 6.0,
-        'beta': 1.5, 'base_K': 0.35, 'rir_scale': 0.30,
+        # Time evolution
+        'g_per_day': 0.0,          # lb/day; intentionally zero in the minimal model
+        'rho_day': 0.75,           # fraction of fatigue retained after one day
+        'q_strength_day': 1.0,     # strength process innovation variance, lb^2/day
+        'q_fatigue_day': 4.0,      # one-day fatigue process innovation variance, lb^2/day
+
+        # Training-dose model U_t
+        'b': 1.0,                  # lb fatigue per dose unit
+        'intensity_p': 2.0,        # super-linear intensity exponent
+        'rir_penalty_c': 0.30,     # proximity-to-failure penalty slope
+        'rir_threshold': 3.0,      # penalty begins below this RIR
+
+        # Set-level observation model
+        'sigma_obs': 7.5,          # baseline set-observation SD, lb
+        'sigma_rir': 2.0,          # additional SD per reported RIR, lb
+
+        # Robust innovation-based variance inflation
+        'robust_beta': 1.0,
+        'robust_z0': 2.5,
+
+        # First-session identification uncertainty
+        'init_fatigue_sd': 10.0,   # uncertainty in first-session fatigue, lb
     }
 
-    def __init__(self, initial_strength: float = 300.0, params: Optional[dict] = None):
+    H = np.array([[1.0, -1.0]])
+    I2 = np.eye(2)
+
+    def __init__(self, params: Optional[dict] = None):
         self.params = {**self.DEFAULT_PARAMS, **(params or {})}
-        self.strength = initial_strength
-        self.fatigue = 0.0
-        self.covariance = 25.0
+        self.state = np.array([300.0, 0.0], dtype=float)
+        self.P = np.diag([100.0, 100.0]).astype(float)
         self.history: List[SessionResult] = []
-        self.avg_stress = 5.0
+        self.avg_stress = 8.0
+        self.last_date: Optional[pd.Timestamp] = None
+        self.initialized = False
+
+    @property
+    def strength(self) -> float:
+        return float(self.state[0])
+
+    @property
+    def fatigue(self) -> float:
+        return float(self.state[1])
+
+    @property
+    def covariance(self) -> np.ndarray:
+        return self.P
 
     def _p(self, key: str) -> float:
-        return self.params[key]
+        return float(self.params[key])
 
-    def process_session(self, session_date: str, sets: List[WorkoutSet]) -> SessionResult:
-        observed = max(s.estimated_1rm() for s in sets)
-        stress = sum(s.stress(self.strength) for s in sets)
-        self.avg_stress = 0.9 * self.avg_stress + 0.1 * stress
-
-        S_pred = self.strength + self._p('mu')
-        P_pred = self.covariance + self._p('Q')
-        F_pred = self._p('rho') * self.fatigue
-
-        E_pred = S_pred - self._p('lambda_f') * F_pred
-
-        resid = observed - E_pred
-        resid_norm = resid / S_pred if S_pred > 0 else 0.0
-
-        R_eff = self._p('R') * (1.0 + self._p('beta') * (resid_norm ** 2))
-
-        K = P_pred / (P_pred + R_eff)
-        K = min(K, self._p('base_K'))
-
-        self.strength = S_pred + K * resid
-        self.covariance = (1.0 - K) * P_pred
-
-        self.fatigue = (
-            self._p('rho') * self.fatigue +
-            self._p('alpha') * stress +
-            self._p('gamma') * max(0.0, -resid_norm)
+    def _obs_variance(self, workout_set: WorkoutSet) -> float:
+        return workout_set.observation_variance(
+            self._p('sigma_obs'), self._p('sigma_rir')
         )
 
-        ci_95 = 1.96 * np.sqrt(self.covariance + R_eff)
+    def _weighted_session_observation(self, sets: List[WorkoutSet]) -> Tuple[float, float]:
+        """Display/initialization aggregate only; filtering itself remains set-level."""
+        ys = np.array([s.estimated_1rm() for s in sets], dtype=float)
+        rs = np.array([self._obs_variance(s) for s in sets], dtype=float)
+        weights = 1.0 / rs
+        mean = float(np.sum(weights * ys) / np.sum(weights))
+        var = float(1.0 / np.sum(weights))
+        return mean, var
+
+    def _decay(self, delta_days: float) -> float:
+        rho = np.clip(self._p('rho_day'), 1e-6, 1.0)
+        return float(rho ** max(delta_days, 0.0))
+
+    def _process_noise(self, delta_days: float, decay: float) -> np.ndarray:
+        """
+        Q(dt) for a random-walk strength state and exponentially decaying fatigue.
+        q_fatigue_day is interpreted as the innovation variance accumulated over one day.
+        """
+        dt = max(float(delta_days), 0.0)
+        q_s = self._p('q_strength_day') * dt
+
+        rho = np.clip(self._p('rho_day'), 1e-6, 1.0)
+        if dt == 0:
+            q_f = 0.0
+        elif abs(rho - 1.0) < 1e-9:
+            q_f = self._p('q_fatigue_day') * dt
+        else:
+            q_f = self._p('q_fatigue_day') * (1.0 - decay ** 2) / (1.0 - rho ** 2)
+
+        return np.array([[q_s, 0.0], [0.0, q_f]], dtype=float)
+
+    def _predict_state(self, state: np.ndarray, P: np.ndarray, delta_days: float) -> Tuple[np.ndarray, np.ndarray]:
+        dt = max(float(delta_days), 0.0)
+        decay = self._decay(dt)
+        A = np.array([[1.0, 0.0], [0.0, decay]], dtype=float)
+
+        x_pred = A @ state
+        x_pred[0] += self._p('g_per_day') * dt
+        P_pred = A @ P @ A.T + self._process_noise(dt, decay)
+        P_pred = 0.5 * (P_pred + P_pred.T)
+        return x_pred, P_pred
+
+    def _set_update(self, x: np.ndarray, P: np.ndarray, workout_set: WorkoutSet) -> Tuple[np.ndarray, np.ndarray, float, float]:
+        y = workout_set.estimated_1rm()
+        R_base = self._obs_variance(workout_set)
+
+        innovation = float(y - (self.H @ x)[0])
+        V_base = float((self.H @ P @ self.H.T)[0, 0] + R_base)
+        z = innovation / np.sqrt(max(V_base, 1e-12))
+
+        inflation = 1.0 + self._p('robust_beta') * max(0.0, abs(z) - self._p('robust_z0')) ** 2
+        R_eff = R_base * inflation
+        V = float((self.H @ P @ self.H.T)[0, 0] + R_eff)
+
+        K = (P @ self.H.T) / max(V, 1e-12)  # 2x1
+        x_new = x + K[:, 0] * innovation
+
+        # Joseph form keeps P symmetric positive semidefinite under finite precision.
+        KH = K @ self.H
+        P_new = (self.I2 - KH) @ P @ (self.I2 - KH).T + K * R_eff @ K.T
+        P_new = 0.5 * (P_new + P_new.T)
+
+        return x_new, P_new, innovation, z
+
+    def initialize_first_session(self, session_date: str, sets: List[WorkoutSet]) -> SessionResult:
+        """
+        First-session initialization without processing the same observations twice.
+
+        We identify available capacity C=S-F from the set observations, set the initial
+        fatigue mean to zero, and retain large uncertainty in the S/F decomposition.
+        """
+        if not sets:
+            raise ValueError("A session must contain at least one set.")
+
+        observed, var_c = self._weighted_session_observation(sets)
+        var_f = self._p('init_fatigue_sd') ** 2
+
+        self.state = np.array([observed, 0.0], dtype=float)
+        # If C and F are independent with S=C+F, then this covariance gives
+        # H P H^T = Var(C) while retaining uncertainty in the S/F split.
+        self.P = np.array([
+            [var_c + var_f, var_f],
+            [var_f, var_f],
+        ], dtype=float)
+
+        available_pre = float((self.H @ self.state)[0])
+        dose = sum(
+            s.dose(
+                available_pre,
+                self._p('intensity_p'),
+                self._p('rir_penalty_c'),
+                self._p('rir_threshold')
+            ) for s in sets
+        )
+        self.avg_stress = dose
+
+        fatigue_pre = self.fatigue
+        self.state[1] += self._p('b') * dose
+        available_post = float((self.H @ self.state)[0])
+
+        strength_ci = 1.96 * np.sqrt(max(self.P[0, 0], 0.0))
+        capacity_ci = 1.96 * np.sqrt(max((self.H @ self.P @ self.H.T)[0, 0], 0.0))
+
+        self.last_date = pd.Timestamp(session_date)
+        self.initialized = True
 
         result = SessionResult(
-            date=session_date, observed=observed, predicted=E_pred,
-            residual=resid, resid_norm=resid_norm, stress=stress,
-            fatigue=self.fatigue, strength=self.strength,
-            covariance=self.covariance, K=K, ci_95=ci_95
+            date=session_date,
+            days_since_prior=0.0,
+            num_sets=len(sets),
+            observed=observed,
+            predicted=np.nan,
+            residual=np.nan,
+            mean_abs_z=np.nan,
+            stress=dose,
+            fatigue_pre=fatigue_pre,
+            fatigue=self.fatigue,
+            strength=self.strength,
+            available_pre_stress=available_pre,
+            available_post_stress=available_post,
+            p_ss=float(self.P[0, 0]),
+            p_sf=float(self.P[0, 1]),
+            p_ff=float(self.P[1, 1]),
+            strength_ci_95=float(strength_ci),
+            capacity_ci_95=float(capacity_ci),
         )
         self.history.append(result)
         return result
 
-    def predict_next(self, sessions_ahead: int = 1, expected_stress: Optional[float] = None) -> Tuple[float, float, float]:
-        if expected_stress is None:
-            expected_stress = self.avg_stress
+    def process_session(self, session_date: str, sets: List[WorkoutSet]) -> SessionResult:
+        if not self.initialized:
+            return self.initialize_first_session(session_date, sets)
+        if not sets:
+            raise ValueError("A session must contain at least one set.")
 
-        S_future = self.strength + sessions_ahead * self._p('mu')
-        F_future = self.fatigue * (self._p('rho') ** sessions_ahead)
-        for i in range(sessions_ahead):
-            F_future = self._p('rho') * F_future + self._p('alpha') * expected_stress
+        current_date = pd.Timestamp(session_date)
+        delta_days = max((current_date - self.last_date).total_seconds() / 86400.0, 0.0)
 
-        E_future = S_future - self._p('lambda_f') * F_future
-        P_future = self.covariance + sessions_ahead * self._p('Q')
-        R_future = self._p('R') * 1.1
-        ci = 1.96 * np.sqrt(P_future + R_future)
+        # 1-2. Recover fatigue / evolve strength and covariance over actual elapsed time.
+        x, P = self._predict_state(self.state, self.P, delta_days)
+        predicted_capacity = float((self.H @ x)[0])
 
-        return E_future, E_future - ci, E_future + ci
+        # Display aggregate only. The actual filter consumes every set sequentially.
+        observed, _ = self._weighted_session_observation(sets)
 
-    def project(self, num_sessions: int, sessions_per_week: int = 3) -> pd.DataFrame:
+        # 3-4. Joint set-level Kalman updates.
+        innovations = []
+        z_scores = []
+        for workout_set in sorted(sets, key=lambda s: s.set_number):
+            x, P, innovation, z = self._set_update(x, P, workout_set)
+            innovations.append(innovation)
+            z_scores.append(z)
+
+        self.state = x
+        self.P = P
+        available_pre = float((self.H @ self.state)[0])
+        fatigue_pre = self.fatigue
+
+        # 5. Training is an input to *future* fatigue, applied after observations.
+        dose = sum(
+            s.dose(
+                available_pre,
+                self._p('intensity_p'),
+                self._p('rir_penalty_c'),
+                self._p('rir_threshold')
+            ) for s in sets
+        )
+        self.avg_stress = 0.9 * self.avg_stress + 0.1 * dose
+        self.state[1] += self._p('b') * dose
+        available_post = float((self.H @ self.state)[0])
+
+        strength_ci = 1.96 * np.sqrt(max(self.P[0, 0], 0.0))
+        capacity_ci = 1.96 * np.sqrt(max((self.H @ self.P @ self.H.T)[0, 0], 0.0))
+
+        result = SessionResult(
+            date=session_date,
+            days_since_prior=float(delta_days),
+            num_sets=len(sets),
+            observed=float(observed),
+            predicted=float(predicted_capacity),
+            residual=float(observed - predicted_capacity),
+            mean_abs_z=float(np.mean(np.abs(z_scores))) if z_scores else np.nan,
+            stress=float(dose),
+            fatigue_pre=float(fatigue_pre),
+            fatigue=self.fatigue,
+            strength=self.strength,
+            available_pre_stress=float(available_pre),
+            available_post_stress=float(available_post),
+            p_ss=float(self.P[0, 0]),
+            p_sf=float(self.P[0, 1]),
+            p_ff=float(self.P[1, 1]),
+            strength_ci_95=float(strength_ci),
+            capacity_ci_95=float(capacity_ci),
+        )
+        self.history.append(result)
+        self.last_date = current_date
+        return result
+
+    def typical_interval_days(self) -> float:
+        intervals = [h.days_since_prior for h in self.history if h.days_since_prior > 0]
+        return float(np.median(intervals)) if intervals else 3.0
+
+    def _future_observation_variance(self, expected_rir: int = 2) -> float:
+        return self._p('sigma_obs') ** 2 + (self._p('sigma_rir') * expected_rir) ** 2
+
+    def predict_next(self, days_ahead: Optional[float] = None, expected_rir: int = 2) -> Tuple[float, float, float]:
+        """Predict available capacity at a future session with no intervening training."""
+        if days_ahead is None:
+            days_ahead = self.typical_interval_days()
+
+        x_future, P_future = self._predict_state(self.state, self.P, days_ahead)
+        expected = float((self.H @ x_future)[0])
+        pred_var = float((self.H @ P_future @ self.H.T)[0, 0] + self._future_observation_variance(expected_rir))
+        ci = 1.96 * np.sqrt(max(pred_var, 0.0))
+        return expected, expected - ci, expected + ci
+
+    def project(self, num_sessions: int, sessions_per_week: int = 3, expected_rir: int = 2) -> pd.DataFrame:
+        """
+        Project repeated future sessions at the current average dose.
+
+        Each projected session: recover/evolve -> predict capacity -> apply one expected
+        training dose to fatigue. No strength adaptation is assumed unless g_per_day != 0.
+        """
         projections = []
-        S, F, P = self.strength, self.fatigue, self.covariance
+        x = self.state.copy()
+        P = self.P.copy()
+        dt = 7.0 / max(float(sessions_per_week), 1.0)
 
         for i in range(1, num_sessions + 1):
-            S += self._p('mu')
-            F = self._p('rho') * F + self._p('alpha') * self.avg_stress
-            P += self._p('Q')
-            E = S - self._p('lambda_f') * F
-            ci = 1.96 * np.sqrt(P + self._p('R'))
+            x, P = self._predict_state(x, P, dt)
+            expected = float((self.H @ x)[0])
+            pred_var = float((self.H @ P @ self.H.T)[0, 0] + self._future_observation_variance(expected_rir))
+            ci = 1.96 * np.sqrt(max(pred_var, 0.0))
+
             projections.append({
-                'session': i, 'week': i / sessions_per_week,
-                'strength': S, 'fatigue': F, 'expected': E,
-                'ci_lower': E - ci, 'ci_upper': E + ci
+                'session': i,
+                'week': i / sessions_per_week,
+                'strength': float(x[0]),
+                'fatigue_pre': float(x[1]),
+                'expected': expected,
+                'ci_lower': expected - ci,
+                'ci_upper': expected + ci,
             })
+
+            # Planned session occurs after the prediction and affects subsequent sessions.
+            x[1] += self._p('b') * self.avg_stress
+
         return pd.DataFrame(projections)
 
 
@@ -417,23 +658,24 @@ def run_model_for_lift(db: Database, user_id: int, lift_id: int, custom_params: 
     saved = db.load_params(user_id, lift_id)
     params = {**StrengthModel.DEFAULT_PARAMS}
     if saved:
+        # Old saved keys are harmless; only keys used by the revised model are read.
         params.update(saved)
     if custom_params:
         params.update(custom_params)
 
     df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values(['date', 'workout_id', 'set_number'])
 
-    first_workout = df[df['workout_id'] == df['workout_id'].iloc[0]]
-    sets = [WorkoutSet(r['weight'], r['reps'], r['rir'], r['set_number']) for _, r in first_workout.iterrows()]
-    initial = max(s.estimated_1rm() for s in sets)
-
-    model = StrengthModel(initial_strength=initial, params=params)
-
+    model = StrengthModel(params=params)
     results = []
-    for wid, group in df.groupby('workout_id'):
+
+    for _, group in df.groupby('workout_id', sort=False):
         group = group.sort_values('set_number')
         session_date = group['date'].iloc[0].strftime('%Y-%m-%d')
-        sets = [WorkoutSet(r['weight'], r['reps'], r['rir'], r['set_number']) for _, r in group.iterrows()]
+        sets = [
+            WorkoutSet(float(r['weight']), int(r['reps']), int(r['rir']), int(r['set_number']))
+            for _, r in group.iterrows()
+        ]
         result = model.process_session(session_date, sets)
         results.append(asdict(result))
 
@@ -497,28 +739,31 @@ def generate_demo_data(db: Database, user_id: int):
 # =============================================================================
 def create_dashboard_plot(model: StrengthModel, results_df: pd.DataFrame, lift_name: str, projection_weeks: int = 8):
     results_df['date'] = pd.to_datetime(results_df['date'])
-    proj = model.project(num_sessions=projection_weeks * 3, sessions_per_week=3)
+    typical_days = max(model.typical_interval_days(), 0.25)
+    sessions_per_week = 7.0 / typical_days
+    num_sessions = max(1, int(np.ceil(projection_weeks * sessions_per_week)))
+    proj = model.project(num_sessions=num_sessions, sessions_per_week=sessions_per_week)
 
     last_date = results_df['date'].iloc[-1]
-    future_dates = [last_date + timedelta(days=int(i*7/3)) for i in range(1, len(proj)+1)]
+    future_dates = [last_date + timedelta(days=i * typical_days) for i in range(1, len(proj) + 1)]
     proj['date'] = future_dates
 
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
         row_heights=[0.7, 0.3], vertical_spacing=0.08,
-        subplot_titles=(f"{lift_name} — Strength Trajectory", "Fatigue & Stress")
+        subplot_titles=(f"{lift_name} — Strength Trajectory", "Fatigue & Training Dose")
     )
 
     fig.add_trace(go.Scatter(
         x=results_df['date'], y=results_df['observed'],
-        mode='markers', name='Observed 1RM',
+        mode='markers', name='Set-weighted Capacity Observation',
         marker=dict(color='#f59e0b', size=10, line=dict(width=1, color='#fff')),
-        hovertemplate='Date: %{x}<br>Observed: %{y:.1f} lbs<extra></extra>'
+        hovertemplate='Date: %{x}<br>Observed capacity: %{y:.1f} lbs<extra></extra>'
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
         x=results_df['date'], y=results_df['strength'],
-        mode='lines', name='True Strength (Smoothed)',
+        mode='lines', name='Latent Fresh Strength',
         line=dict(color='#3b82f6', width=3),
         hovertemplate='Date: %{x}<br>Strength: %{y:.1f} lbs<extra></extra>'
     ), row=1, col=1)
@@ -531,11 +776,11 @@ def create_dashboard_plot(model: StrengthModel, results_df: pd.DataFrame, lift_n
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
-        x=results_df['date'], y=results_df['strength'] + results_df['ci_95'],
+        x=results_df['date'], y=results_df['strength'] + results_df['strength_ci_95'],
         mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'
     ), row=1, col=1)
     fig.add_trace(go.Scatter(
-        x=results_df['date'], y=results_df['strength'] - results_df['ci_95'],
+        x=results_df['date'], y=results_df['strength'] - results_df['strength_ci_95'],
         mode='lines', line=dict(width=0), fill='tonexty',
         fillcolor='rgba(59, 130, 246, 0.15)', name='95% CI', hoverinfo='skip'
     ), row=1, col=1)
@@ -559,14 +804,14 @@ def create_dashboard_plot(model: StrengthModel, results_df: pd.DataFrame, lift_n
 
     fig.add_trace(go.Scatter(
         x=results_df['date'], y=results_df['fatigue'],
-        mode='lines', name='Fatigue',
+        mode='lines', name='Fatigue (lb suppression)',
         line=dict(color='#ef4444', width=2),
         hovertemplate='Date: %{x}<br>Fatigue: %{y:.1f}<extra></extra>'
     ), row=2, col=1)
 
     fig.add_trace(go.Bar(
         x=results_df['date'], y=results_df['stress'],
-        name='Stress', marker_color='#f97316', opacity=0.6,
+        name='Training Dose', marker_color='#f97316', opacity=0.6,
         hovertemplate='Date: %{x}<br>Stress: %{y:.2f}<extra></extra>'
     ), row=2, col=1)
 
@@ -580,7 +825,7 @@ def create_dashboard_plot(model: StrengthModel, results_df: pd.DataFrame, lift_n
         hovermode='x unified'
     )
     fig.update_yaxes(title_text='Weight (lbs)', row=1, col=1)
-    fig.update_yaxes(title_text='Fatigue / Stress', row=2, col=1)
+    fig.update_yaxes(title_text='Fatigue (lb) / Dose', row=2, col=1)
     fig.update_xaxes(title_text='Date', row=2, col=1)
     return fig
 
@@ -622,7 +867,7 @@ def export_to_excel(db: Database, user_id: int, lift_id: Optional[int] = None) -
 def page_auth(db: Database):
     st.markdown('<div class="auth-box">', unsafe_allow_html=True)
     st.markdown("<h2 style='text-align:center;margin-bottom:4px;'>Strength Model</h2>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align:center;opacity:0.6;margin-bottom:24px;'>Linear Estimation Towards Linear Progression</p>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;opacity:0.6;margin-bottom:24px;'>Joint State Estimation of Strength and Fatigue</p>", unsafe_allow_html=True)
 
     tab_login, tab_register = st.tabs(["Sign In", "Create Account"])
 
@@ -770,7 +1015,7 @@ def page_dashboard(db: Database, user_id: int):
         return
 
     latest = results.iloc[-1]
-    pred, ci_low, ci_high = model.predict_next(sessions_ahead=1)
+    pred, ci_low, ci_high = model.predict_next()
 
     # --- Metrics with info popovers ---
     mcol1, mcol2, mcol3, mcol4 = st.columns(4)
@@ -778,25 +1023,25 @@ def page_dashboard(db: Database, user_id: int):
         metric_with_info(
             "True Strength",
             f"{latest['strength']:.1f} <small>lbs</small>",
-            "**True Strength** is the filter's best estimate of your latent 1-rep max, stripped of fatigue and measurement noise. "
-            "It drifts upward slowly via the progressive gain parameter (mu). "
+            "**True Strength** is the joint filter's estimate of fresh latent 1-rep-max-equivalent capacity. "
+            "It is inferred jointly with fatigue from every set and is not forced upward by a per-session gain term. "
             "Units: pounds (lbs)."
         )
     with mcol2:
         metric_with_info(
             "Current Fatigue",
             f"{latest['fatigue']:.1f}",
-            "**Fatigue** accumulates from session stress and underperformance residuals, then decays between sessions. "
-            "It is dimensionless but scaled to live on the same order as stress (~5-15). "
-            "High fatigue suppresses your expected performance but does not linearly reduce true strength."
+            "**Fatigue** is a latent state measured in pounds of performance suppression. "
+            "It decays according to actual elapsed days, is inferred jointly with strength from set-level performance, "
+            "and receives a post-session increment from training dose."
         )
     with mcol3:
         delta = latest['strength'] - results.iloc[0]['strength']
         metric_with_info(
             "Total Gain",
-            f"+{delta:.1f} <small>lbs</small>",
-            "**Total Gain** is the difference between your current smoothed strength and your strength at the first logged session. "
-            "It reflects the cumulative effect of the progressive gain parameter (mu) across all sessions."
+            f"{delta:+.1f} <small>lbs</small>",
+            "**Total Gain** is the difference between the current posterior latent-strength estimate and the first-session estimate. "
+            "The minimal model does not impose automatic linear progression, so this change is data-driven."
         )
     with mcol4:
         metric_with_info(
@@ -810,7 +1055,7 @@ def page_dashboard(db: Database, user_id: int):
     st.markdown("---")
     st.markdown(f"""
     <div class="prediction-card">
-        <div class="metric-label">Next Session Prediction</div>
+        <div class="metric-label">Next Session Prediction (typical spacing)</div>
         <div class="prediction-main">{pred:.1f} <small>lbs</small></div>
         <div class="prediction-ci">95% Confidence Interval: {ci_low:.1f} — {ci_high:.1f} lbs</div>
     </div>
@@ -830,9 +1075,9 @@ def page_dashboard(db: Database, user_id: int):
 
     # --- Recent History ---
     with st.expander("Recent Session Details"):
-        display_df = results[['date', 'observed', 'predicted', 'residual', 'stress', 'fatigue', 'strength']].tail(10)
+        display_df = results[['date', 'days_since_prior', 'observed', 'predicted', 'residual', 'mean_abs_z', 'stress', 'fatigue', 'strength']].tail(10)
         display_df = display_df.round(2)
-        display_df.columns = ['Date', 'Observed', 'Expected', 'Residual', 'Stress', 'Fatigue', 'Smoothed Strength']
+        display_df.columns = ['Date', 'Days Since Prior', 'Observed', 'Expected', 'Residual', 'Mean |z|', 'Dose', 'Fatigue (lb)', 'Latent Strength']
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
@@ -997,7 +1242,7 @@ def page_export(db: Database, user_id: int):
     if lift_id:
         model, results = run_model_for_lift(db, user_id, lift_id)
         if model is not None:
-            display = results[['date', 'observed', 'predicted', 'strength', 'fatigue', 'stress', 'ci_95']].round(2)
+            display = results[['date', 'days_since_prior', 'observed', 'predicted', 'strength', 'fatigue', 'stress', 'strength_ci_95', 'capacity_ci_95']].round(2)
             st.dataframe(display, use_container_width=True, hide_index=True)
 
 
@@ -1008,44 +1253,109 @@ def page_settings(db: Database, user_id: int):
     st.title("Settings")
     st.caption(f"Logged in as **{st.session_state.username}**")
 
-    st.markdown("### Model Parameters")
-    st.caption("These parameters control how the Kalman Filter estimates your strength.")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        mu = st.number_input("Progressive Gain (mu)", value=0.3, step=0.1, format="%.2f",
-                             help="Expected strength gain per session (lbs)")
-        rho = st.number_input("Fatigue Decay (rho)", value=0.70, step=0.05, format="%.2f",
-                              help="How much fatigue carries over between sessions")
-        alpha = st.number_input("Stress Accumulation (alpha)", value=0.30, step=0.05, format="%.2f",
-                                help="How much session stress adds to fatigue")
-    with col2:
-        gamma = st.number_input("Residual Correction (gamma)", value=8.0, step=1.0, format="%.1f",
-                                help="How much underperformance boosts fatigue estimate")
-        lambda_f = st.number_input("Fatigue Scale (lambda_f)", value=0.60, step=0.05, format="%.2f",
-                                   help="How much fatigue subtracts from performance (<1)")
-        Q = st.number_input("Process Noise (Q)", value=2.0, step=0.5, format="%.1f",
-                            help="Variance of random strength fluctuations")
-    with col3:
-        R = st.number_input("Measurement Noise (R)", value=6.0, step=0.5, format="%.1f",
-                            help="Base variance of 1RM estimation error")
-        beta = st.number_input("Adaptive Inflation (beta)", value=1.5, step=0.5, format="%.1f",
-                               help="How much to inflate measurement noise for large residuals")
-        base_K = st.number_input("Max Kalman Gain", value=0.35, step=0.05, format="%.2f",
-                                 help="Cap on how much a single session can update strength")
-
-    params = {
-        'mu': mu, 'rho': rho, 'alpha': alpha, 'gamma': gamma,
-        'lambda_f': lambda_f, 'Q': Q, 'R': R, 'beta': beta, 'base_K': base_K
-    }
-
-    st.markdown("---")
-
     lifts = db.get_lifts(user_id)
-    if lifts:
+    if not lifts:
+        st.info("Log at least one lift before saving model parameters.")
+    else:
         lift_names = {l['name']: l['id'] for l in lifts}
-        selected = st.selectbox("Apply to Lift", list(lift_names.keys()))
+        selected = st.selectbox("Apply parameters to lift", list(lift_names.keys()))
         lift_id = lift_names[selected]
+
+        current = {**StrengthModel.DEFAULT_PARAMS}
+        saved = db.load_params(user_id, lift_id)
+        if saved:
+            current.update({k: v for k, v in saved.items() if k in current})
+
+        st.markdown("### Model Parameters")
+        st.caption("The revised model jointly estimates latent strength and fatigue using actual elapsed time and set-level observations.")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            rho_day = st.number_input(
+                "Daily Fatigue Retention (rho_day)", min_value=0.01, max_value=1.0,
+                value=float(current['rho_day']), step=0.05, format="%.2f", key=f"rho_day_{lift_id}",
+                help="Fraction of fatigue retained after one day. Recovery over dt days is rho_day^dt."
+            )
+            b = st.number_input(
+                "Dose → Fatigue (b)", min_value=0.0,
+                value=float(current['b']), step=0.1, format="%.2f", key=f"b_{lift_id}",
+                help="Pounds of next-session performance suppression added per session-dose unit."
+            )
+            intensity_p = st.number_input(
+                "Intensity Exponent (p)", min_value=1.0,
+                value=float(current['intensity_p']), step=0.1, format="%.2f", key=f"intensity_p_{lift_id}",
+                help="Super-linear weighting of relative intensity in the session-dose equation."
+            )
+            rir_penalty_c = st.number_input(
+                "RIR Dose Penalty (c)", min_value=0.0,
+                value=float(current['rir_penalty_c']), step=0.05, format="%.2f", key=f"rir_penalty_c_{lift_id}",
+                help="Extra training-dose multiplier for work below the RIR threshold."
+            )
+
+        with col2:
+            rir_threshold = st.number_input(
+                "RIR Threshold (q0)", min_value=0.0, max_value=10.0,
+                value=float(current['rir_threshold']), step=1.0, format="%.1f", key=f"rir_threshold_{lift_id}",
+                help="Extra dose penalty begins when reported RIR is below this value."
+            )
+            q_strength_day = st.number_input(
+                "Strength Process Variance / Day", min_value=0.0,
+                value=float(current['q_strength_day']), step=0.25, format="%.2f", key=f"q_strength_day_{lift_id}",
+                help="Random-walk innovation variance for latent strength, in lb²/day."
+            )
+            q_fatigue_day = st.number_input(
+                "Fatigue Process Variance / Day", min_value=0.0,
+                value=float(current['q_fatigue_day']), step=0.5, format="%.2f", key=f"q_fatigue_day_{lift_id}",
+                help="One-day innovation variance for the exponentially decaying fatigue state, in lb²/day."
+            )
+            g_per_day = st.number_input(
+                "Strength Drift (g, lb/day)",
+                value=float(current['g_per_day']), step=0.05, format="%.3f", key=f"g_per_day_{lift_id}",
+                help="Default is zero. Later this should be replaced by a training-dependent adaptation model."
+            )
+
+        with col3:
+            sigma_obs = st.number_input(
+                "Baseline Observation SD (lb)", min_value=0.1,
+                value=float(current['sigma_obs']), step=0.5, format="%.1f", key=f"sigma_obs_{lift_id}",
+                help="Baseline standard deviation of a set-level RIR-adjusted e1RM observation."
+            )
+            sigma_rir = st.number_input(
+                "RIR Uncertainty SD / RIR (lb)", min_value=0.0,
+                value=float(current['sigma_rir']), step=0.5, format="%.1f", key=f"sigma_rir_{lift_id}",
+                help="Adds observation uncertainty as reported RIR increases."
+            )
+            robust_z0 = st.number_input(
+                "Robustness Threshold |z|", min_value=0.0,
+                value=float(current['robust_z0']), step=0.25, format="%.2f", key=f"robust_z0_{lift_id}",
+                help="Variance inflation begins when a standardized innovation exceeds this threshold."
+            )
+            robust_beta = st.number_input(
+                "Robustness Inflation (beta)", min_value=0.0,
+                value=float(current['robust_beta']), step=0.25, format="%.2f", key=f"robust_beta_{lift_id}",
+                help="Controls how sharply observation variance grows beyond the z threshold."
+            )
+            init_fatigue_sd = st.number_input(
+                "Initial Fatigue Uncertainty SD (lb)", min_value=0.1,
+                value=float(current['init_fatigue_sd']), step=1.0, format="%.1f", key=f"init_fatigue_sd_{lift_id}",
+                help="Uncertainty in how much of first-session capacity reflects fatigue versus fresh strength."
+            )
+
+        params = {
+            'rho_day': rho_day,
+            'b': b,
+            'intensity_p': intensity_p,
+            'rir_penalty_c': rir_penalty_c,
+            'rir_threshold': rir_threshold,
+            'q_strength_day': q_strength_day,
+            'q_fatigue_day': q_fatigue_day,
+            'g_per_day': g_per_day,
+            'sigma_obs': sigma_obs,
+            'sigma_rir': sigma_rir,
+            'robust_z0': robust_z0,
+            'robust_beta': robust_beta,
+            'init_fatigue_sd': init_fatigue_sd,
+        }
 
         if st.button("Save Parameters", type="primary"):
             db.save_params(user_id, lift_id, params)
@@ -1069,16 +1379,17 @@ def page_settings(db: Database, user_id: int):
     st.markdown("---")
     st.markdown("### About")
     st.markdown("""
-    **StrengthTracker** uses a domain-adapted Kalman Filter to separate true latent strength
-    from noisy workout observations. Key features:
+    **StrengthTracker** now uses a two-state Kalman-style filter:
 
-    - **Progressive adaptation** (mu): slow strength drift upward
-    - **Fatigue accumulation** (rho, alpha, gamma): stress builds and decays
-    - **Scale-corrected residuals**: normalized by strength to prevent magnitude mismatches
-    - **Adaptive trust**: big residuals inflate measurement noise so outliers don't break the model
-    - **RIR-aware stress**: closer to failure = higher stress via `1 + 0.3*(3-RIR)`
+    - `x = [strength, fatigue]^T`, with a full 2×2 covariance matrix
+    - actual elapsed days determine fatigue recovery via `rho_day^Δt`
+    - every set is a separate observation of `strength - fatigue`
+    - session training dose is applied to fatigue only *after* the session's observations
+    - negative residuals are no longer manually assigned to both lower strength and higher fatigue
+    - set outliers are handled using standardized-innovation variance inflation
+    - the minimal model imposes no automatic strength gain (`g = 0` by default)
 
-    Prediction: `E_next = S_t - lambda_f * F_t + mu` with 95% CI from posterior covariance.
+    the current RIR-adjusted Brzycki observation and dose equation remain prototypes and should eventually be calibrated from longitudinal data.
     """)
 
 
